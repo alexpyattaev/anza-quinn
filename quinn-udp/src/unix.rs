@@ -93,12 +93,11 @@ impl UdpSocketState {
             target_os = "hurd",
             solarish
         )))]
-        if is_ipv4 || !io.only_v6()? {
-            if let Err(_err) =
+        if (is_ipv4 || !io.only_v6()?)
+            && let Err(_err) =
                 set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_RECVTOS, OPTION_ON)
-            {
-                crate::log::debug!("Ignoring error setting IP_RECVTOS on socket: {_err:?}");
-            }
+        {
+            crate::log::debug!("Ignoring error setting IP_RECVTOS on socket: {_err:?}");
         }
 
         let mut may_fragment = false;
@@ -146,21 +145,6 @@ impl UdpSocketState {
                 set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, OPTION_ON)
             {
                 crate::log::debug!("Ignoring error setting SO_TIMESTAMPNS on socket: {_err:?}");
-            }
-
-            if is_ipv4 || !io.only_v6()? {
-                if let Err(_err) =
-                    set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_RECVERR, OPTION_ON)
-                {
-                    crate::log::debug!("ignoring error setting IP_RECVERR on socket: {_err:?}");
-                }
-            }
-            if !is_ipv4 {
-                if let Err(_err) =
-                    set_socket_option(&*io, libc::IPPROTO_IPV6, libc::IPV6_RECVERR, OPTION_ON)
-                {
-                    crate::log::debug!("ignoring error setting IPV6_RECVERR on socket: {_err:?}");
-                }
             }
         }
         #[cfg(any(target_os = "freebsd", apple))]
@@ -307,13 +291,56 @@ impl UdpSocketState {
         recv_single(socket.0, bufs, meta)
     }
 
-    /// Receives a pending, asynchronous transport-layer error from this socket
+    /// Enables asynchronous transport-layer error reception for this socket
     ///
-    /// On Linux and Android this pops one entry from the socket error queue
-    /// (`MSG_ERRQUEUE`). Returns `None` if the queue is empty or if the
-    /// underlying platform is unsupported.
+    /// On Linux and Android, this enables the socket error queue via
+    /// `IP_RECVERR`/`IPV6_RECVERR`, allowing ICMP errors to be retrieved with
+    /// [`recv_transport_error`]. On other platforms, this method is a no-op and
+    /// [`recv_transport_error`] will always return `None`.
+    ///
+    /// # Cost
+    ///
+    /// On Linux and Android, queued ICMP errors are charged against the socket's
+    /// receive buffer (`sk_rmem_alloc`). If the buffer is full, incoming errors
+    /// are silently dropped by the kernel. There is no overhead when the error
+    /// queue is empty.
+    ///
+    /// # Usage
+    ///
+    /// When this feature is enabled, the kernel may return a pending error on the
+    /// next `sendmsg` or `recvmsg` call, preventing that operation from completing.
+    /// To avoid this, callers should drain the error queue via
+    /// [`recv_transport_error`] before sending or receiving.
+    ///
+    /// [`recv_transport_error`]: Self::recv_transport_error
+    pub fn enable_transport_errors(&self, _socket: UdpSockRef<'_>) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let io = _socket.0;
+            let addr = io.local_addr()?;
+            let is_ipv4 = addr.family() == libc::AF_INET as libc::sa_family_t;
+
+            if is_ipv4 || !io.only_v6()? {
+                set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_RECVERR, OPTION_ON)?;
+            }
+
+            if !is_ipv4 {
+                set_socket_option(&*io, libc::IPPROTO_IPV6, libc::IPV6_RECVERR, OPTION_ON)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Receives one pending asynchronous transport-layer error from this socket
+    ///
+    /// Returns `None` if the error queue is empty or the underlying platform is
+    /// unsupported. On Linux and Android, errors are only available if
+    /// [`enable_transport_errors`] has been called first.
     ///
     /// Returns an error if the underlying system call fails unexpectedly.
+    ///
+    /// [`enable_transport_errors`]: Self::enable_transport_errors
     pub fn recv_transport_error(
         &self,
         _socket: UdpSockRef<'_>,
@@ -634,6 +661,7 @@ fn recv_via_recvmmsg(
 }
 
 #[cfg(any(
+    test,
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
@@ -651,23 +679,13 @@ pub(crate) fn recv_single(
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; cmsg::LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
-    prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
     let n = loop {
-        let n = unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) };
-
-        if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            continue;
-        }
-
-        if n >= 0 {
+        let n = retry_if_interrupted(|| {
+            prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
+            unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) }
+        })?;
+        if hdr.msg_flags & libc::MSG_TRUNC == 0 {
             break n;
-        }
-
-        let e = io::Error::last_os_error();
-        match e.kind() {
-            // Retry receiving
-            io::ErrorKind::Interrupted => continue,
-            _ => return Err(e),
         }
     };
     meta[0] = decode_recv(&name, &hdr, n as usize)?;
@@ -826,10 +844,10 @@ struct ControlMetadata {
 
 impl ControlMetadata {
     /// Decodes a control message and updates the metadata state
-    fn decode(&mut self, cmsg: &libc::cmsghdr) {
+    fn decode(&mut self, cmsg: cmsg::CMsg<'_, libc::cmsghdr>) {
         match (cmsg.cmsg_level, cmsg.cmsg_type) {
             (libc::IPPROTO_IP, libc::IP_TOS) => unsafe {
-                self.ecn_bits = cmsg::decode::<u8, libc::cmsghdr>(cmsg);
+                self.ecn_bits = cmsg.decode::<u8>();
             },
             // FreeBSD uses IP_RECVTOS here, and we can be liberal because cmsgs are opt-in.
             #[cfg(not(any(
@@ -840,7 +858,7 @@ impl ControlMetadata {
                 solarish
             )))]
             (libc::IPPROTO_IP, libc::IP_RECVTOS) => unsafe {
-                self.ecn_bits = cmsg::decode::<u8, libc::cmsghdr>(cmsg);
+                self.ecn_bits = cmsg.decode::<u8>();
             },
             #[cfg(not(target_os = "redox",))]
             (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => unsafe {
@@ -850,14 +868,14 @@ impl ControlMetadata {
                 if cfg!(apple)
                     && cmsg.cmsg_len as usize == libc::CMSG_LEN(size_of::<u8>() as _) as usize
                 {
-                    self.ecn_bits = cmsg::decode::<u8, libc::cmsghdr>(cmsg);
+                    self.ecn_bits = cmsg.decode::<u8>();
                 } else {
-                    self.ecn_bits = cmsg::decode::<libc::c_int, libc::cmsghdr>(cmsg) as u8;
+                    self.ecn_bits = cmsg.decode::<libc::c_int>() as u8;
                 }
             },
             #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
-                let pktinfo = unsafe { cmsg::decode::<libc::in_pktinfo, libc::cmsghdr>(cmsg) };
+                let pktinfo = unsafe { cmsg.decode::<libc::in_pktinfo>() };
                 self.dst_ip = Some(IpAddr::V4(Ipv4Addr::from(
                     pktinfo.ipi_addr.s_addr.to_ne_bytes(),
                 )));
@@ -865,12 +883,12 @@ impl ControlMetadata {
             }
             #[cfg(any(bsd, apple))]
             (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
-                let in_addr = unsafe { cmsg::decode::<libc::in_addr, libc::cmsghdr>(cmsg) };
+                let in_addr = unsafe { cmsg.decode::<libc::in_addr>() };
                 self.dst_ip = Some(IpAddr::V4(Ipv4Addr::from(in_addr.s_addr.to_ne_bytes())));
             }
             #[cfg(not(any(target_os = "redox", target_os = "hurd")))]
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
-                let pktinfo = unsafe { cmsg::decode::<libc::in6_pktinfo, libc::cmsghdr>(cmsg) };
+                let pktinfo = unsafe { cmsg.decode::<libc::in6_pktinfo>() };
                 self.dst_ip = Some(IpAddr::V6(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)));
                 #[cfg_attr(not(target_os = "android"), expect(clippy::unnecessary_cast))]
                 {
@@ -879,11 +897,11 @@ impl ControlMetadata {
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::SOL_UDP, libc::UDP_GRO) => unsafe {
-                self.stride = cmsg::decode::<libc::c_int, libc::cmsghdr>(cmsg) as usize;
+                self.stride = cmsg.decode::<libc::c_int>() as usize;
             },
             #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS) => {
-                let ts = unsafe { cmsg::decode::<libc::timespec, libc::cmsghdr>(cmsg) };
+                let ts = unsafe { cmsg.decode::<libc::timespec>() };
                 let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
                 let nsecs = u32::try_from(ts.tv_nsec).unwrap_or(0);
                 self.timestamp = Some(Duration::new(secs, nsecs));
@@ -1011,5 +1029,69 @@ pub(crate) fn retry_if_interrupted(mut f: impl FnMut() -> isize) -> io::Result<i
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{net::UdpSocket, sync::mpsc, thread};
+
+    #[test]
+    fn recv_single_after_truncation_returns_would_block_instead_of_spin() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut buffer = [0; 8];
+            let result = recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut [RecvMeta::default()],
+            );
+            done_tx.send(result).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a regressed receive loop before failing the test.
+            sender.send_to(b"ok", address).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        }
+        worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn recv_single_skips_truncated_datagrams() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        // Block instead of polling, since loopback delivery can be asynchronous (on FreeBSD)
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = receiver.local_addr().unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+        sender.send_to(b"ok", address).unwrap();
+
+        let mut buffer = [0; 8];
+        let mut meta = [RecvMeta::default()];
+        assert_eq!(
+            recv_single(
+                SockRef::from(&receiver),
+                &mut [IoSliceMut::new(&mut buffer)],
+                &mut meta,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(&buffer[..meta[0].len], b"ok");
+        assert_eq!(meta[0].addr, sender.local_addr().unwrap());
     }
 }

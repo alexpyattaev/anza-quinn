@@ -23,7 +23,11 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
+    token::TokenKey,
 };
+
+mod initial;
+pub use initial::{InitialContext, InitialDecision, InitialFilter, InitialMetadata};
 
 mod transport;
 #[cfg(feature = "qlog")]
@@ -206,8 +210,10 @@ pub struct ServerConfig {
     /// Configuration for sending and handling validation tokens
     pub validation_token: ValidationTokenConfig,
 
-    /// Used to generate one-time AEAD keys to protect handshake tokens
-    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
+    /// Keys used to protect handshake tokens, including cached authentication key material
+    pub(crate) token_key: TokenKey,
+
+    pub(crate) initial_filter: Option<Arc<dyn InitialFilter>>,
 
     /// Duration after a retry token was issued for which it's considered valid
     pub(crate) retry_token_lifetime: Duration,
@@ -238,7 +244,8 @@ impl ServerConfig {
             transport: Arc::new(TransportConfig::default()),
             crypto,
 
-            token_key,
+            token_key: TokenKey::new(token_key),
+            initial_filter: None,
             retry_token_lifetime: Duration::from_secs(15),
 
             migration: true,
@@ -254,6 +261,14 @@ impl ServerConfig {
 
             time_source: Arc::new(StdSystemTime),
         }
+    }
+
+    /// Install a synchronous policy for new Initial packets.
+    ///
+    /// No filter is installed by default. Existing connections bypass this policy.
+    pub fn initial_filter(&mut self, filter: Arc<dyn InitialFilter>) -> &mut Self {
+        self.initial_filter = Some(filter);
+        self
     }
 
     /// Set a custom [`TransportConfig`]
@@ -272,8 +287,12 @@ impl ServerConfig {
     }
 
     /// Private key used to authenticate data included in handshake tokens
+    ///
+    /// Retry tokens are MAC-only; NEW_TOKENs are encrypted and protected by an outer MAC.
+    /// Installing a key prepares its authentication key once. Changing the key invalidates
+    /// outstanding tokens; servers sharing tokens must use the same key.
     pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-        self.token_key = value;
+        self.token_key = TokenKey::new(value);
         self
     }
 
@@ -310,13 +329,13 @@ impl ServerConfig {
         self
     }
 
-    /// Maximum number of [`Incoming`][crate::Incoming] to allow to exist at a time
+    /// Maximum number of incoming connection attempts to hold before they become active
     ///
-    /// An [`Incoming`][crate::Incoming] comes into existence when an incoming connection attempt
-    /// is received and stops existing when the application either accepts it or otherwise disposes
-    /// of it. While this limit is reached, new incoming connection attempts are immediately
-    /// refused. Larger values have greater worst-case memory consumption, but accommodate greater
-    /// application latency in handling incoming connection attempts.
+    /// An attempt counts toward this limit from the time its initial packet is received until it is
+    /// either registered as an active connection or otherwise disposed of. While this limit is
+    /// reached, new incoming connection attempts are not admitted. Larger values have greater
+    /// worst-case memory consumption, but accommodate greater application latency in handling
+    /// incoming connection attempts.
     ///
     /// The default value is set to 65536. With a typical Ethernet MTU of 1500 bytes, this limits
     /// memory consumption from this to under 100 MiB--a generous amount that still prevents memory
@@ -326,13 +345,11 @@ impl ServerConfig {
         self
     }
 
-    /// Maximum number of received bytes to buffer for each [`Incoming`][crate::Incoming]
+    /// Maximum number of received bytes to buffer for each incoming connection attempt
     ///
-    /// An [`Incoming`][crate::Incoming] comes into existence when an incoming connection attempt
-    /// is received and stops existing when the application either accepts it or otherwise disposes
-    /// of it. This limit governs only packets received within that period, and does not include
-    /// the first packet. Packets received in excess of this limit are dropped, which may cause
-    /// 0-RTT or handshake data to have to be retransmitted.
+    /// This limit governs packets received after the first packet and before the attempt is either
+    /// registered as an active connection or otherwise disposed of. Packets received in excess of
+    /// this limit are dropped, which may cause 0-RTT or handshake data to have to be retransmitted.
     ///
     /// The default value is set to 10 MiB--an amount such that in most situations a client would
     /// not transmit that much 0-RTT data faster than the server handles the corresponding
@@ -342,14 +359,12 @@ impl ServerConfig {
         self
     }
 
-    /// Maximum number of received bytes to buffer for all [`Incoming`][crate::Incoming]
-    /// collectively
+    /// Maximum number of received bytes to buffer collectively for all incoming connection attempts
     ///
-    /// An [`Incoming`][crate::Incoming] comes into existence when an incoming connection attempt
-    /// is received and stops existing when the application either accepts it or otherwise disposes
-    /// of it. This limit governs only packets received within that period, and does not include
-    /// the first packet. Packets received in excess of this limit are dropped, which may cause
-    /// 0-RTT or handshake data to have to be retransmitted.
+    /// This limit governs packets received after each attempt's first packet and before the attempt
+    /// is either registered as an active connection or otherwise disposed of. Packets received in
+    /// excess of this limit are dropped, which may cause 0-RTT or handshake data to have to be
+    /// retransmitted.
     ///
     /// The default value is set to 100 MiB--a generous amount that still prevents memory
     /// exhaustion in most contexts.
@@ -414,6 +429,10 @@ impl fmt::Debug for ServerConfig {
         fmt.debug_struct("ServerConfig")
             .field("transport", &self.transport)
             // crypto not debug
+            .field(
+                "initial_filter",
+                &self.initial_filter.as_ref().map(|_| "configured"),
+            )
             // token not debug
             .field("retry_token_lifetime", &self.retry_token_lifetime)
             .field("validation_token", &self.validation_token)

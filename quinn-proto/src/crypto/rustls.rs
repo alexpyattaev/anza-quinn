@@ -103,8 +103,8 @@ impl crypto::Session for TlsSession {
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
-        match self.inner {
-            Connection::Client(ref session) => Some(session.is_early_data_accepted()),
+        match &self.inner {
+            Connection::Client(session) => Some(session.is_early_data_accepted()),
             _ => None,
         }
     }
@@ -130,9 +130,9 @@ impl crypto::Session for TlsSession {
             // Hack around the lack of an explicit signal from rustls to reflect ClientHello being
             // ready on incoming connections, or ALPN negotiation completing on outgoing
             // connections.
-            let have_server_name = match self.inner {
+            let have_server_name = match &self.inner {
                 Connection::Client(_) => false,
-                Connection::Server(ref session) => session.server_name().is_some(),
+                Connection::Server(session) => session.server_name().is_some(),
             };
             if self.inner.alpn_protocol().is_some() || have_server_name || !self.is_handshaking() {
                 self.got_handshake_data = true;
@@ -553,8 +553,12 @@ impl crypto::ServerConfig for QuicServerConfig {
         Ok(initial_keys(version, dst_cid, Side::Server, &self.initial))
     }
 
+    fn supports_version(&self, version: u32) -> bool {
+        interpret_version(version).is_ok()
+    }
+
     fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16] {
-        // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
+        // Safe: Initial keys or supports_version already accepted this version.
         let version = interpret_version(version).unwrap();
         let (nonce, key) = match version {
             Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),

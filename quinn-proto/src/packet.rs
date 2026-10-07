@@ -109,6 +109,17 @@ impl PartialDecode {
         self.buf.get_ref().len()
     }
 
+    /// Token of an Initial packet, prior to removal of header protection; empty for other packets
+    ///
+    /// Header protection masks only the first byte and the packet number, both of which lie
+    /// outside `token_pos`, so these bytes are already plaintext.
+    pub(crate) fn initial_token(&self) -> &[u8] {
+        match self.plain_header.as_initial() {
+            Some(header) => &self.buf.get_ref()[header.token_pos.start..header.token_pos.end],
+            None => &[],
+        }
+    }
+
     pub(crate) fn finish(
         self,
         header_crypto: Option<&dyn crypto::HeaderKey>,
@@ -284,16 +295,16 @@ impl Header {
     pub(crate) fn encode(&self, w: &mut Vec<u8>) -> PartialEncode {
         use Header::*;
         let start = w.len();
-        match *self {
+        match self {
             Initial(InitialHeader {
-                ref dst_cid,
-                ref src_cid,
-                ref token,
+                dst_cid,
+                src_cid,
+                token,
                 number,
                 version,
             }) => {
                 w.write(u8::from(LongHeaderType::Initial) | number.tag());
-                w.write(version);
+                w.write(*version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
                 w.write_var(token.len() as u64);
@@ -308,13 +319,13 @@ impl Header {
             }
             Long {
                 ty,
-                ref dst_cid,
-                ref src_cid,
+                dst_cid,
+                src_cid,
                 number,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Standard(ty)) | number.tag());
-                w.write(version);
+                w.write(u8::from(LongHeaderType::Standard(*ty)) | number.tag());
+                w.write(*version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
                 w.write::<u16>(0); // Placeholder for payload length; see `set_payload_length`
@@ -326,12 +337,12 @@ impl Header {
                 }
             }
             Retry {
-                ref dst_cid,
-                ref src_cid,
+                dst_cid,
+                src_cid,
                 version,
             } => {
                 w.write(u8::from(LongHeaderType::Retry));
-                w.write(version);
+                w.write(*version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
                 PartialEncode {
@@ -343,13 +354,13 @@ impl Header {
             Short {
                 spin,
                 key_phase,
-                ref dst_cid,
+                dst_cid,
                 number,
             } => {
                 w.write(
                     FIXED_BIT
-                        | if key_phase { KEY_PHASE_BIT } else { 0 }
-                        | if spin { SPIN_BIT } else { 0 }
+                        | if *key_phase { KEY_PHASE_BIT } else { 0 }
+                        | if *spin { SPIN_BIT } else { 0 }
                         | number.tag(),
                 );
                 w.put_slice(dst_cid);
@@ -361,9 +372,9 @@ impl Header {
                 }
             }
             VersionNegotiate {
-                ref random,
-                ref dst_cid,
-                ref src_cid,
+                random,
+                dst_cid,
+                src_cid,
             } => {
                 w.write(0x80u8 | random);
                 w.write::<u32>(0);

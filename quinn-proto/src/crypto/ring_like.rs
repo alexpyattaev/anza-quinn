@@ -30,6 +30,15 @@ impl crypto::HandshakeTokenKey for hkdf::Prk {
         let key = aead::UnboundKey::new(&aead::AES_256_GCM, &key_buffer).unwrap();
         Box::new(aead::LessSafeKey::new(key))
     }
+
+    fn token_authentication_key(&self) -> Box<dyn crypto::HmacKey> {
+        let mut key = [0; 32];
+        self.expand(&[b"quinn token authentication v1"], hkdf::HKDF_SHA256)
+            .unwrap()
+            .fill(&mut key)
+            .unwrap();
+        Box::new(hmac::Key::new(hmac::HMAC_SHA256, &key))
+    }
 }
 
 impl crypto::AeadKey for aead::LessSafeKey {

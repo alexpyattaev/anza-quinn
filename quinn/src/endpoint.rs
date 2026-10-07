@@ -84,10 +84,10 @@ impl Endpoint {
     ))]
     pub fn client(addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                tracing::debug!(%e, "unable to make socket dual-stack");
-            }
+        if addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            tracing::debug!(%e, "unable to make socket dual-stack");
         }
         socket.bind(&addr.into())?;
         let runtime =
@@ -126,10 +126,10 @@ impl Endpoint {
     ))]
     pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                tracing::debug!(%e, "unable to make socket dual-stack");
-            }
+        if addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            tracing::debug!(%e, "unable to make socket dual-stack");
         }
         socket.bind(&addr.into())?;
         let runtime =
@@ -259,7 +259,7 @@ impl Endpoint {
         Ok(endpoint
             .recv_state
             .connections
-            .insert(ch, conn, sender, self.runtime.clone()))
+            .insert(ch, conn, sender, false, self.runtime.clone()))
     }
 
     /// Switch to a new UDP socket
@@ -280,6 +280,7 @@ impl Endpoint {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        inner.sender = inner.socket.create_sender();
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
@@ -350,7 +351,7 @@ impl Endpoint {
         loop {
             {
                 let endpoint = &mut *self.inner.state.lock().unwrap();
-                if endpoint.recv_state.connections.is_empty() {
+                if endpoint.is_idle() {
                     break;
                 }
                 // Construct future while lock is held to avoid race
@@ -394,8 +395,9 @@ impl Future for EndpointDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut endpoint = self.0.state.lock().unwrap();
-        if endpoint.driver.is_none() {
-            endpoint.driver = Some(cx.waker().clone());
+        match endpoint.driver.as_mut() {
+            Some(old_waker) => old_waker.clone_from(cx.waker()),
+            None => endpoint.driver = Some(cx.waker().clone()),
         }
 
         let now = endpoint.runtime.now();
@@ -407,9 +409,7 @@ impl Future for EndpointDriver {
             self.0.shared.incoming.notify_waiters();
         }
 
-        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0
-            && endpoint.recv_state.connections.is_empty()
-        {
+        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
             Poll::Ready(Ok(()))
         } else {
             drop(endpoint);
@@ -432,6 +432,12 @@ impl Drop for EndpointDriver {
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
         endpoint.recv_state.connections.senders.clear();
+        // Clearing the senders is what makes the endpoint idle, but a waiter already parked on
+        // `idle` only re-reads that after being notified, and with the driver gone nothing else
+        // can wake it. Same reason as the equivalent check in `EndpointInner::accept`.
+        if endpoint.is_idle() {
+            self.0.shared.idle.notify_waiters();
+        }
     }
 }
 
@@ -447,21 +453,46 @@ impl EndpointInner {
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<Connecting, ConnectionError> {
-        let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
-        let now = state.runtime.now();
-        match state
-            .inner
-            .accept(incoming, now, &mut response_buffer, server_config)
-        {
+
+        // Phase 1: reserve endpoint state for the connection under the lock.
+        let accepting = {
+            let mut state = self.state.lock().unwrap();
+            let now = state.runtime.now();
+            match state
+                .inner
+                .start_accept(incoming, now, &mut response_buffer, server_config)
+            {
+                Ok(accepting) => {
+                    state.pending_accepts += 1;
+                    accepting
+                }
+                Err(error) => {
+                    if let Some(transmit) = error.response {
+                        respond(transmit, &response_buffer, &mut state.sender);
+                    }
+                    return Err(error.cause);
+                }
+            }
+        };
+
+        // Phase 2: TLS session setup, connection construction, and first-packet handling,
+        // without holding the lock.
+        let accepted = accepting.accept();
+
+        // Phase 3: register the connection, or release the reservation, under the lock.
+        let mut state = self.state.lock().unwrap();
+        state.pending_accepts -= 1;
+        let result = match state.inner.finish_accept(accepted, &mut response_buffer) {
             Ok((handle, conn)) => {
                 state.stats.accepted_handshakes += 1;
                 let sender = state.socket.create_sender();
                 let runtime = state.runtime.clone();
+                let driver_lost = state.driver_lost;
                 Ok(state
                     .recv_state
                     .connections
-                    .insert(handle, conn, sender, runtime))
+                    .insert(handle, conn, sender, driver_lost, runtime))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -469,7 +500,13 @@ impl EndpointInner {
                 }
                 Err(error.cause)
             }
+        };
+        // Failed accepts and accepts completed after driver loss cannot rely on a Drained event
+        // being processed to wake idle waiters.
+        if state.is_idle() {
+            self.shared.idle.notify_waiters();
         }
+        result
     }
 
     pub(crate) fn refuse(&self, incoming: proto::Incoming) {
@@ -511,6 +548,8 @@ pub(crate) struct State {
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
     default_client_config: Option<ClientConfig>,
+    /// Connections in the process of being accepted
+    pending_accepts: usize,
 }
 
 #[derive(Debug)]
@@ -569,7 +608,7 @@ impl State {
 
             if event.is_drained() {
                 self.recv_state.connections.senders.remove(&ch);
-                if self.recv_state.connections.is_empty() {
+                if self.is_idle() {
                     shared.idle.notify_waiters();
                 }
             }
@@ -587,6 +626,10 @@ impl State {
         }
 
         true
+    }
+
+    fn is_idle(&self) -> bool {
+        self.recv_state.connections.is_empty() && self.pending_accepts == 0
     }
 }
 
@@ -673,17 +716,25 @@ impl ConnectionSet {
         handle: ConnectionHandle,
         conn: proto::Connection,
         sender: Pin<Box<dyn UdpSender>>,
+        driver_lost: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
-        if let Some((error_code, ref reason)) = self.close {
+        if let Some((error_code, reason)) = &self.close {
             send.send(ConnectionEvent::Close {
-                error_code,
+                error_code: *error_code,
                 reason: reason.clone(),
             })
             .unwrap();
         }
-        self.senders.insert(handle, send);
+        match driver_lost {
+            // Close the event channel before spawning the connection driver, so it cannot
+            // transmit a handshake after the endpoint driver has stopped.
+            true => drop(send),
+            false => {
+                self.senders.insert(handle, send);
+            }
+        }
         Connecting::new(handle, conn, self.sender.clone(), recv, sender, runtime)
     }
 
@@ -770,6 +821,7 @@ impl EndpointRef {
                 runtime,
                 stats: EndpointStats::default(),
                 default_client_config: None,
+                pending_accepts: 0,
             }),
         }))
     }
@@ -924,14 +976,14 @@ impl RecvState {
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
                     continue;
                 }
                 // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
                 // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
                 // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
                 // it anyways.
-                Poll::Ready(Err(ref e)) if is_msg_size_err(e) => {
+                Poll::Ready(Err(e)) if is_msg_size_err(&e) => {
                     continue;
                 }
                 Poll::Ready(Err(e)) => {

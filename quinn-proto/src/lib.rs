@@ -59,8 +59,9 @@ mod config;
 #[cfg(feature = "qlog")]
 pub use config::QlogConfig;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
-    ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
+    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, InitialContext,
+    InitialDecision, InitialFilter, InitialMetadata, MtuDiscoveryConfig, ServerConfig,
+    StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
 };
 
 pub mod crypto;
@@ -71,7 +72,8 @@ pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
 
 mod endpoint;
 pub use crate::endpoint::{
-    AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
+    AcceptError, Accepted, Accepting, ConnectError, ConnectionHandle, DatagramEvent, Endpoint,
+    Incoming, RetryError,
 };
 
 mod packet;

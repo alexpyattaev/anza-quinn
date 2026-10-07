@@ -1,6 +1,11 @@
 #[cfg(apple)]
 use std::io::{self, IoSlice};
-#[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "wasi",
+    solarish
+)))]
 use std::net::{SocketAddr, SocketAddrV6};
 #[cfg(apple)]
 use std::os::fd::AsRawFd;
@@ -12,7 +17,9 @@ use std::{
     slice,
 };
 
-use quinn_udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
+#[cfg(not(target_os = "wasi"))]
+use quinn_udp::EcnCodepoint;
+use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 #[cfg(apple)]
 use socket2::MsgHdr;
 use socket2::Socket;
@@ -40,6 +47,16 @@ fn basic() {
 }
 
 #[test]
+fn state_before_bind() {
+    for domain in [socket2::Domain::IPV6, socket2::Domain::IPV4] {
+        let Ok(socket) = Socket::new(domain, socket2::Type::DGRAM, None) else {
+            continue;
+        };
+        UdpSocketState::new((&socket).into()).unwrap();
+    }
+}
+
+#[test]
 fn basic_src_ip() {
     let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
         .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
@@ -62,7 +79,9 @@ fn basic_src_ip() {
     );
 }
 
+// The WASI backend sets no ECN codepoint and always reports `None`.
 #[test]
+#[cfg(not(target_os = "wasi"))]
 fn ecn_v6() {
     let send = Socket::from(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap());
     let recv = Socket::from(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap());
@@ -82,7 +101,12 @@ fn ecn_v6() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "wasi",
+    solarish
+)))]
 fn ecn_v4() {
     let send = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
     let recv = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
@@ -102,7 +126,12 @@ fn ecn_v4() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "wasi",
+    solarish
+)))]
 fn ecn_v6_dualstack() {
     let recv = Socket::new(
         socket2::Domain::IPV6,
@@ -148,7 +177,12 @@ fn ecn_v6_dualstack() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "wasi",
+    solarish
+)))]
 fn ecn_v4_mapped_v6() {
     let send = Socket::new(
         socket2::Domain::IPV6,
@@ -212,6 +246,28 @@ fn gso() {
             ecn: None,
             contents: &msg,
             segment_size: Some(SEGMENT_SIZE),
+            src_ip: None,
+        },
+    );
+}
+
+/// A single datagram larger than the segment size used to probe for GSO support must be
+/// delivered as one datagram. The probe must not leave segmentation enabled on the socket.
+#[test]
+fn large_single_datagram_is_not_segmented() {
+    let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let dst_addr = recv.local_addr().unwrap();
+    // Larger than the 1500 byte segment size of the GSO probe.
+    let msg = vec![0xCD; 2048];
+    test_send_recv(
+        &send.into(),
+        &recv.into(),
+        Transmit {
+            destination: dst_addr,
+            ecn: None,
+            contents: &msg,
+            segment_size: None,
             src_ip: None,
         },
     );
@@ -295,7 +351,8 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
     let recv_state = UdpSocketState::new(recv.into()).unwrap();
 
     // Reverse non-blocking flag set by `UdpSocketState` to make the test non-racy
-    recv.set_nonblocking(false).unwrap();
+    UdpSockRef::from(send).set_nonblocking(false).unwrap();
+    UdpSockRef::from(recv).set_nonblocking(false).unwrap();
 
     send_state.try_send(send.into(), &transmit).unwrap();
 
@@ -610,6 +667,9 @@ fn recv_transport_error() {
     let sock = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
 
     let state = UdpSocketState::new((&sock).into()).unwrap();
+    state
+        .enable_transport_errors((&sock).into())
+        .expect("failed to enable transport error recv");
 
     // Pick an unused port by binding then dropping.
     let unused_port = {
@@ -672,6 +732,9 @@ fn recv_transport_error_ipv6() {
     let sock = Socket::from(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap());
 
     let state = UdpSocketState::new((&sock).into()).unwrap();
+    state
+        .enable_transport_errors((&sock).into())
+        .expect("failed to enable transport error recv");
 
     let unused_port = {
         let tmp = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
@@ -715,4 +778,80 @@ fn recv_transport_error_ipv6() {
     if let Some(addr) = err.addr {
         assert_eq!(addr.ip(), dst.ip());
     }
+}
+
+/// Draining the error queue prevents queued ICMP errors from absorbing unrelated sends
+///
+/// When `enable_transport_errors` is active, callers are expected to drain pending
+/// errors via `recv_transport_error` before transmitting. This test confirms that
+/// doing so allows a subsequent send to succeed and deliver its payload.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn draining_error_queue_before_send_prevents_absorption() {
+    let sock = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+
+    let state = UdpSocketState::new((&sock).into()).unwrap();
+    state
+        .enable_transport_errors((&sock).into())
+        .expect("failed to enable transport error recv");
+
+    // Pick an unused port by binding then dropping.
+    let unused_port = {
+        let tmp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        tmp.local_addr().unwrap().port()
+    };
+
+    // Enqueue an ICMP port-unreachable error
+    let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, unused_port));
+    state
+        .try_send(
+            (&sock).into(),
+            &Transmit {
+                destination: dst,
+                ecn: None,
+                contents: b"hello",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Drain the error queue before sending — this is the intended usage pattern
+    let mut got_error = false;
+    for _ in 0..10 {
+        match state.recv_transport_error((&sock).into()) {
+            Ok(Some(_)) => {
+                got_error = true;
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert!(got_error, "expected one queued error");
+
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+
+    state
+        .try_send(
+            (&sock).into(),
+            &Transmit {
+                destination: receiver.local_addr().unwrap(),
+                ecn: None,
+                contents: b"connection close",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .expect("send failed after draining the error queue");
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    let mut buf = [0u8; 64];
+    let n = receiver
+        .recv(&mut buf)
+        .expect("packet was not delivered after draining the error queue");
+    assert_eq!(&buf[..n], b"connection close");
 }
