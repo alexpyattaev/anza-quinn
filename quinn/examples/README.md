@@ -125,6 +125,7 @@ different client arriving immediately after exceeds the budget, is dropped, and 
 `InitialFilter` has two hooks, both executed synchronously in the receive path; they must not block
 or re-enter the endpoint. `allow_initial` runs first and can enforce a global budget before any
 token authentication, replay-log access or Initial-key derivation. `decide` runs after token
-validation, so an `Ignore` there has already paid the token cost. Fast Retry skips Initial-key
-derivation with the built-in provider; custom crypto providers should override `supports_version`
-to get the same benefit. Existing connections bypass the hooks.
+validation, so an `Ignore` there has already paid the token cost (with the built-in providers, a
+forged token costs one MAC check). Fast Retry skips Initial-key derivation with the built-in
+provider; custom crypto providers should override `supports_version` to get the same benefit.
+Existing connections bypass the hooks.

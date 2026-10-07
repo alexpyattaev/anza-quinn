@@ -1,9 +1,13 @@
 //! Admission ordering and fast Retry regressions
 use super::*;
 use crate::{
-    crypto::{HandshakeTokenKey, Keys, UnsupportedVersion},
-    token::{Token, TokenPayload},
+    crypto::{CryptoError, HandshakeTokenKey, HmacKey, Keys, UnsupportedVersion},
+    token::TokenPayload,
 };
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::hkdf;
+#[cfg(feature = "ring")]
+use ring::hkdf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// `InitialFilter` with a switchable admission gate and a fixed verdict, recording what it saw
@@ -54,16 +58,18 @@ struct Counts {
     initial_keys: AtomicUsize,
     retry_tags: AtomicUsize,
     token_aeads: AtomicUsize,
+    token_macs: AtomicUsize,
     token_log: AtomicUsize,
 }
 
 impl Counts {
-    /// `[initial_keys, retry_tags, token_aeads, token_log]`
-    fn values(&self) -> [usize; 4] {
+    /// `[initial_keys, retry_tags, token_aeads, token_macs, token_log]`
+    fn values(&self) -> [usize; 5] {
         [
             &self.initial_keys,
             &self.retry_tags,
             &self.token_aeads,
+            &self.token_macs,
             &self.token_log,
         ]
         .map(|v| v.load(Ordering::Relaxed))
@@ -106,8 +112,21 @@ impl crypto::ServerConfig for SpyCrypto {
     }
 }
 
+/// Fixed handshake token key material, so tokens issued before instrumentation stay valid
+fn token_key() -> hkdf::Prk {
+    hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&[42; 32])
+}
+
+/// `keyed_server_config()` using [`token_key`]
+fn keyed_server_config() -> ServerConfig {
+    let mut config = server_config();
+    config.token_key(Arc::new(token_key()));
+    config
+}
+
+/// Token key counting expensive operations
 struct SpyToken {
-    inner: Arc<dyn HandshakeTokenKey>,
+    inner: hkdf::Prk,
     counts: Arc<Counts>,
 }
 
@@ -115,6 +134,34 @@ impl HandshakeTokenKey for SpyToken {
     fn aead_from_hkdf(&self, random: &[u8]) -> Box<dyn crypto::AeadKey> {
         self.counts.token_aeads.fetch_add(1, Ordering::Relaxed);
         self.inner.aead_from_hkdf(random)
+    }
+
+    fn token_authentication_key(&self) -> Box<dyn HmacKey> {
+        Box::new(SpyMac {
+            inner: self.inner.token_authentication_key(),
+            counts: self.counts.clone(),
+        })
+    }
+}
+
+struct SpyMac {
+    inner: Box<dyn HmacKey>,
+    counts: Arc<Counts>,
+}
+
+impl HmacKey for SpyMac {
+    fn sign(&self, data: &[u8], signature_out: &mut [u8]) {
+        self.counts.token_macs.fetch_add(1, Ordering::Relaxed);
+        self.inner.sign(data, signature_out)
+    }
+
+    fn signature_len(&self) -> usize {
+        self.inner.signature_len()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
+        self.counts.token_macs.fetch_add(1, Ordering::Relaxed);
+        self.inner.verify(data, signature)
     }
 }
 
@@ -127,6 +174,7 @@ impl TokenLog for SpyLog {
     }
 }
 
+/// Count expensive operations of a [`keyed_server_config`]
 fn instrument(config: &mut ServerConfig, reject_versions: bool) -> Arc<Counts> {
     let counts = Arc::new(Counts::default());
     config.crypto = Arc::new(SpyCrypto {
@@ -134,10 +182,10 @@ fn instrument(config: &mut ServerConfig, reject_versions: bool) -> Arc<Counts> {
         counts: counts.clone(),
         reject: reject_versions,
     });
-    config.token_key = Arc::new(SpyToken {
-        inner: config.token_key.clone(),
+    config.token_key(Arc::new(SpyToken {
+        inner: token_key(),
         counts: counts.clone(),
-    });
+    }));
     config.validation_token.log = Arc::new(SpyLog(counts.clone()));
     counts
 }
@@ -170,8 +218,15 @@ fn server_endpoint(config: ServerConfig) -> Endpoint {
     Endpoint::new(Default::default(), Some(Arc::new(config)), true)
 }
 
-/// Issue a NEW_TOKEN (`validation`) or Retry token for `addr`
-fn issue_token(config: &ServerConfig, addr: SocketAddr, validation: bool) -> Vec<u8> {
+/// Issue a NEW_TOKEN (`validation`) or a Retry token for `addr`
+///
+/// A Retry token is valid on an Initial whose DCID is `dst_cid`.
+fn issue_token(
+    config: &ServerConfig,
+    addr: SocketAddr,
+    dst_cid: ConnectionId,
+    validation: bool,
+) -> Vec<u8> {
     let payload = if validation {
         TokenPayload::Validation {
             ip: addr.ip(),
@@ -180,11 +235,12 @@ fn issue_token(config: &ServerConfig, addr: SocketAddr, validation: bool) -> Vec
     } else {
         TokenPayload::Retry {
             address: addr,
-            orig_dst_cid: ConnectionId::new(&[1; 8]),
+            orig_dst_cid: ConnectionId::new(&[9; 8]),
+            retry_src_cid: dst_cid,
             issued: config.time_source.now(),
         }
     };
-    Token::new(payload, &mut rand::rng()).encode(&*config.token_key)
+    config.token_key.encode(payload, &mut rand::rng())
 }
 
 fn is_retry(datagram: &[u8]) -> bool {
@@ -194,20 +250,21 @@ fn is_retry(datagram: &[u8]) -> bool {
 #[test]
 fn admission_rejects_all_tokens_before_crypto_and_replay_log() {
     let addr = "[::1]:4433".parse().unwrap();
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let policy = Policy::new(InitialDecision::Proceed);
     policy.allow.store(false, Ordering::Relaxed);
     let validation = true;
+    let dst_cid = ConnectionId::new(&[1; 8]);
     let tokens = [
         vec![],
         vec![7; 80],
         vec![7; 1000],
-        issue_token(&config, addr, !validation),
-        issue_token(&config, addr, validation),
+        issue_token(&config, addr, dst_cid, !validation),
+        issue_token(&config, addr, dst_cid, validation),
     ];
     let packets: Vec<_> = tokens
         .iter()
-        .map(|token| initial_packet(&config, ConnectionId::new(&[1; 8]), token))
+        .map(|token| initial_packet(&config, dst_cid, token))
         .collect();
     let reject_versions = false;
     let counts = instrument(&mut config, reject_versions);
@@ -231,7 +288,7 @@ fn admission_rejects_all_tokens_before_crypto_and_replay_log() {
     }
     assert_eq!(
         counts.values(),
-        [0; 4],
+        [0; 5],
         "gate rejection must precede all crypto and replay-log work"
     );
     assert!(
@@ -256,7 +313,7 @@ fn admission_rejects_all_tokens_before_crypto_and_replay_log() {
     endpoint.ignore(incoming);
     assert_eq!(
         counts.values(),
-        [1, 0, 1, 1],
+        [1, 0, 1, 1, 1],
         "Proceed must not decode the token a second time"
     );
 }
@@ -265,7 +322,7 @@ fn admission_rejects_all_tokens_before_crypto_and_replay_log() {
 fn filtered_handshake_proceed_and_retry() {
     for verdict in [InitialDecision::Proceed, InitialDecision::Retry] {
         let policy = Policy::new(verdict);
-        let mut config = server_config();
+        let mut config = keyed_server_config();
         config.initial_filter(policy.clone());
         let mut pair = Pair::new(Default::default(), config);
         pair.connect();
@@ -298,7 +355,7 @@ fn filtered_handshake_proceed_and_retry() {
 fn filtered_handshake_ignore() {
     let _guard = subscribe();
     let policy = Policy::new(InitialDecision::Ignore);
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     config.initial_filter(policy.clone());
     let mut pair = Pair::new(Default::default(), config);
     let client_addr = pair.client.addr;
@@ -338,9 +395,9 @@ fn filtered_handshake_ignore() {
 fn post_token_ignore_pays_token_cost_only() {
     let addr = "[::1]:4433".parse().unwrap();
     for validation in [false, true] {
-        let mut config = server_config();
+        let mut config = keyed_server_config();
         let token = if validation {
-            issue_token(&config, addr, validation)
+            issue_token(&config, addr, ConnectionId::new(&[1; 8]), validation)
         } else {
             vec![7; 80]
         };
@@ -353,8 +410,9 @@ fn post_token_ignore_pays_token_cost_only() {
         assert!(event.is_none(), "Ignore must not produce an event");
         assert_eq!(
             counts.values(),
-            [0, 0, 1, usize::from(validation)],
-            "Ignore must pay only token decoding (validation token: {validation})"
+            [0, 0, 1, 1, 1].map(|n| n * usize::from(validation)),
+            "Ignore must pay only token decoding; a bogus token is rejected before any MAC \
+             (validation token: {validation})"
         );
     }
 }
@@ -362,7 +420,7 @@ fn post_token_ignore_pays_token_cost_only() {
 #[test]
 fn fast_retry_provider_fallback_and_replacement() {
     let addr = "[::1]:4433".parse().unwrap();
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
     let reject_versions = false;
     let counts = instrument(&mut config, reject_versions);
@@ -380,11 +438,11 @@ fn fast_retry_provider_fallback_and_replacement() {
     }
     assert_eq!(
         counts.values(),
-        [3, 3, 3, 0],
-        "default supports_version derives keys once per Retry"
+        [3, 3, 0, 3, 0],
+        "default supports_version derives keys once per Retry; Retry tokens need only a MAC"
     );
 
-    let mut replacement = server_config();
+    let mut replacement = keyed_server_config();
     replacement.initial_filter(Policy::new(InitialDecision::Retry));
     let reject_versions = true;
     let counts = instrument(&mut replacement, reject_versions);
@@ -393,7 +451,7 @@ fn fast_retry_provider_fallback_and_replacement() {
     assert!(event.is_none(), "unsupported version must be dropped");
     assert_eq!(
         counts.values(),
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0],
         "unsupported provider must never reach retry_tag"
     );
 }
@@ -404,7 +462,7 @@ fn malformed_initial_is_budgeted_and_no_filter_retains_close() {
     let mut data = BytesMut::from(hex!("c4 00000001 00 00 00 3f").as_ref());
     data.resize(MIN_INITIAL_SIZE.into(), 0);
     for allow in [false, true] {
-        let mut config = server_config();
+        let mut config = keyed_server_config();
         let reject_versions = false;
         let counts = instrument(&mut config, reject_versions);
         let policy = Policy::new(InitialDecision::Retry);
@@ -425,11 +483,11 @@ fn malformed_initial_is_budgeted_and_no_filter_retains_close() {
         );
         assert_eq!(
             counts.values(),
-            [usize::from(allow), 0, 0, 0],
+            [usize::from(allow), 0, 0, 0, 0],
             "malformed initial must derive keys only when admitted (allow: {allow})"
         );
     }
-    let event = server_endpoint(server_config()).handle(
+    let event = server_endpoint(keyed_server_config()).handle(
         Instant::now(),
         addr,
         None,
@@ -443,12 +501,14 @@ fn malformed_initial_is_budgeted_and_no_filter_retains_close() {
     );
 }
 
+/// A MAC-valid Retry token presented on an Initial with a different DCID than the Retry assigned
+/// draws INVALID_TOKEN, bypassing the filter, exactly like the no-filter path.
 #[test]
 fn authenticated_invalid_retry_retains_error_response() {
     let addr = "[::1]:4433".parse().unwrap();
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let validation = false;
-    let token = issue_token(&config, "[::1]:4434".parse().unwrap(), validation);
+    let token = issue_token(&config, addr, ConnectionId::new(&[3; 8]), validation);
     let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &token);
     let policy = Policy::new(InitialDecision::Retry);
     config.initial_filter(policy.clone());
@@ -460,11 +520,38 @@ fn authenticated_invalid_retry_retains_error_response() {
     );
     assert!(
         !is_retry(&out),
-        "a Retry token bound to another address draws CONNECTION_CLOSE, not Retry"
+        "a Retry token bound to another DCID draws CONNECTION_CLOSE, not Retry"
     );
     assert!(
         policy.seen().is_empty(),
         "decide must not run for an invalid Retry token"
+    );
+}
+
+/// A Retry token presented from another address fails its MAC, so the peer is merely unvalidated
+/// and the filter may retry it again.
+#[test]
+fn retry_token_from_other_address_is_unvalidated() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let mut config = keyed_server_config();
+    let validation = false;
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    let token = issue_token(&config, "[::1]:4434".parse().unwrap(), dst_cid, validation);
+    let data = initial_packet(&config, dst_cid, &token);
+    let policy = Policy::new(InitialDecision::Retry);
+    config.initial_filter(policy.clone());
+    let mut out = Vec::new();
+    let event = server_endpoint(config).handle(Instant::now(), addr, None, None, data, &mut out);
+    assert!(
+        matches!(event, Some(DatagramEvent::Response(_))),
+        "expected a response datagram"
+    );
+    assert!(is_retry(&out), "an unvalidated peer may be retried");
+    let seen = policy.seen();
+    assert_eq!(seen.len(), 1, "decide must run once");
+    assert!(
+        !seen[0].remote_address_validated() && seen[0].may_retry(),
+        "a token bound to another address must not validate this one"
     );
 }
 
@@ -492,7 +579,7 @@ impl crypto::ServerConfig for NoInitialKeys {
 #[test]
 fn built_in_fast_retry_skips_initial_keys_and_retains_no_route() {
     let addr = "[::1]:4433".parse().unwrap();
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[7; 80]);
     config.crypto = Arc::new(NoInitialKeys(config.crypto.clone()));
     config.max_incoming = 1;
@@ -522,9 +609,9 @@ fn built_in_fast_retry_skips_initial_keys_and_retains_no_route() {
 #[test]
 fn no_filter_validates_reserved_bits_before_consuming_token() {
     let addr = "[::1]:4433".parse().unwrap();
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let validation = true;
-    let token = issue_token(&config, addr, validation);
+    let token = issue_token(&config, addr, ConnectionId::new(&[1; 8]), validation);
     let mut data = initial_packet(&config, ConnectionId::new(&[1; 8]), &token);
     // Flip a protected reserved bit without changing the header protection sample.
     data[0] ^= 0x04;
@@ -535,14 +622,14 @@ fn no_filter_validates_reserved_bits_before_consuming_token() {
     assert!(event.is_none(), "reserved bits violation must be dropped");
     assert_eq!(
         counts.values(),
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0],
         "without a filter, the token must not be decoded before header validation"
     );
 }
 
 #[test]
 fn existing_connection_bypasses_exhausted_admission() {
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let policy = Policy::new(InitialDecision::Retry);
     config.initial_filter(policy.clone());
     let mut pair = Pair::new(Default::default(), config);
@@ -567,7 +654,7 @@ fn existing_connection_bypasses_exhausted_admission() {
 fn endpoint_version_list_cannot_force_unsupported_retry_crypto() {
     let addr = "[::1]:4433".parse().unwrap();
     let unknown_version: u32 = 0x12345678;
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let mut data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
     data[1..5].copy_from_slice(&unknown_version.to_be_bytes());
     config.initial_filter(Policy::new(InitialDecision::Retry));
@@ -594,7 +681,7 @@ fn default_admission_hook_allows_simple_retry_policy() {
             InitialDecision::Retry
         }
     }
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     config.initial_filter(Arc::new(Retry));
     Pair::new(Default::default(), config).connect();
 }
@@ -613,16 +700,16 @@ fn global_budget_bounds_new_cids_addresses_and_valid_token_replays() {
             InitialDecision::Ignore
         }
     }
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let packets: Vec<_> = (0u16..100)
         .map(|i| {
             let addr: SocketAddr = format!("[::1]:{}", 4433 + i).parse().unwrap();
+            let dst_cid = ConnectionId::new(&u64::from(i).to_be_bytes());
             let token = match i % 3 {
                 0 => vec![7; 80],
-                1 => issue_token(&config, addr, false),
-                _ => issue_token(&config, addr, true),
+                1 => issue_token(&config, addr, dst_cid, false),
+                _ => issue_token(&config, addr, dst_cid, true),
             };
-            let dst_cid = ConnectionId::new(&u64::from(i).to_be_bytes());
             (addr, initial_packet(&config, dst_cid, &token))
         })
         .collect();
@@ -644,14 +731,14 @@ fn global_budget_bounds_new_cids_addresses_and_valid_token_replays() {
     }
     assert_eq!(
         counts.values(),
-        [0, 0, budget, 2],
-        "only the {budget} admitted initials may pay token costs"
+        [0, 0, 2, 4, 2],
+        "only the {budget} admitted initials may pay token costs, and bogus tokens none"
     );
 }
 
 #[test]
 fn coalesced_initials_generate_one_retry() {
-    let mut config = server_config();
+    let mut config = keyed_server_config();
     let mut data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
     data.extend_from_slice(&data.clone());
     let policy = Policy::new(InitialDecision::Retry);

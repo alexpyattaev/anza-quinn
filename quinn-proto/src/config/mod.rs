@@ -23,6 +23,7 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
+    token::TokenKey,
 };
 
 mod initial;
@@ -209,8 +210,8 @@ pub struct ServerConfig {
     /// Configuration for sending and handling validation tokens
     pub validation_token: ValidationTokenConfig,
 
-    /// Used to generate one-time AEAD keys to protect handshake tokens
-    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
+    /// Keys used to protect handshake tokens, including cached authentication key material
+    pub(crate) token_key: TokenKey,
 
     pub(crate) initial_filter: Option<Arc<dyn InitialFilter>>,
 
@@ -243,7 +244,7 @@ impl ServerConfig {
             transport: Arc::new(TransportConfig::default()),
             crypto,
 
-            token_key,
+            token_key: TokenKey::new(token_key),
             initial_filter: None,
             retry_token_lifetime: Duration::from_secs(15),
 
@@ -286,8 +287,12 @@ impl ServerConfig {
     }
 
     /// Private key used to authenticate data included in handshake tokens
+    ///
+    /// Retry tokens are MAC-only; NEW_TOKENs are encrypted and protected by an outer MAC.
+    /// Installing a key prepares its authentication key once. Changing the key invalidates
+    /// outstanding tokens; servers sharing tokens must use the same key.
     pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-        self.token_key = value;
+        self.token_key = TokenKey::new(value);
         self
     }
 

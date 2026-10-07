@@ -4,6 +4,7 @@ use std::io::Cursor;
 
 use super::*;
 use crate::packet::{FixedLengthConnectionIdParser, ProtectedHeader};
+use crate::token::{IncomingToken, InvalidRetryTokenError, TokenPayload};
 
 #[test]
 fn oversized_cached_initial_token() {
@@ -179,6 +180,127 @@ fn retry_token_expired() {
     assert_eq!(pair.client.known_cids(), 0);
     assert_eq!(pair.server.known_connections(), 0);
     assert_eq!(pair.server.known_cids(), 0);
+}
+
+fn decode_token(
+    cid: ConnectionId,
+    token: &[u8],
+    config: &ServerConfig,
+    address: SocketAddr,
+) -> Result<IncomingToken, InvalidRetryTokenError> {
+    IncomingToken::from_header(cid, token, config, address)
+}
+
+#[test]
+fn mac_retry_binding_expiry_and_retransmission() {
+    let issued = UNIX_EPOCH + Duration::from_millis(42_950);
+    let clock = Arc::new(FakeTimeSource(Mutex::new(issued)));
+    let mut config = server_config();
+    config
+        .time_source(clock.clone())
+        .retry_token_lifetime(Duration::from_millis(100));
+    let address: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let original = ConnectionId::new(&[1; 20]);
+    let retry = ConnectionId::new(&[2; 8]);
+    let token = config.token_key.encode(
+        TokenPayload::Retry {
+            address,
+            orig_dst_cid: original,
+            retry_src_cid: retry,
+            issued,
+        },
+        &mut rand::rng(),
+    );
+
+    // A token belongs to a connection attempt, not one packet. Repeated Initials remain valid.
+    for _ in 0..2 {
+        let validated = decode_token(retry, &token, &config, address).ok().unwrap();
+        assert!(validated.validated);
+        assert_eq!(validated.orig_dst_cid, original);
+        assert_eq!(validated.retry_src_cid, Some(retry));
+    }
+    // A MAC-valid token cannot be reused with arbitrary destination CIDs.
+    assert!(decode_token(original, &token, &config, address).is_err());
+    // Failed address authentication follows the same unvalidated policy as any other bad MAC.
+    for changed in ["127.0.0.1:4434", "127.0.0.2:4433"] {
+        assert!(
+            !decode_token(retry, &token, &config, changed.parse().unwrap())
+                .ok()
+                .unwrap()
+                .validated
+        );
+    }
+    clock.advance(Duration::from_millis(100));
+    assert!(decode_token(retry, &token, &config, address).is_ok());
+    clock.advance(Duration::from_millis(1));
+    assert!(decode_token(retry, &token, &config, address).is_err());
+    // Preserve tolerance of a slightly later issuing clock on a server sharing the key.
+    *clock.0.lock().unwrap() = issued - Duration::from_millis(1);
+    assert!(decode_token(retry, &token, &config, address).is_ok());
+}
+
+#[test]
+fn bogus_mac_tokens_remain_unvalidated_for_manual_policy() {
+    let address: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let original = ConnectionId::new(&[1; 20]);
+    let retry = ConnectionId::new(&[2; 8]);
+    for respond_retry in [false, true] {
+        for validation in [false, true] {
+            let config = server_config();
+            let payload = if validation {
+                TokenPayload::Validation {
+                    ip: address.ip(),
+                    issued: config.time_source.now(),
+                }
+            } else {
+                TokenPayload::Retry {
+                    address,
+                    orig_dst_cid: original,
+                    retry_src_cid: retry,
+                    issued: config.time_source.now(),
+                }
+            };
+            let mut token = config.token_key.encode(payload, &mut rand::rng());
+            *token.last_mut().unwrap() ^= 1;
+            let mut packet = Vec::new();
+            let encoded = Header::Initial(InitialHeader {
+                dst_cid: retry,
+                src_cid: ConnectionId::new(&[3; 8]),
+                token: token.into(),
+                number: PacketNumber::U8(0),
+                version: 1,
+            })
+            .encode(&mut packet);
+            packet.resize(1200, 0);
+            let keys = config.crypto.initial_keys(1, retry).unwrap();
+            encoded.finish(
+                &mut packet,
+                &*keys.header.remote,
+                Some((0, &*keys.packet.remote)),
+            );
+            let mut server = Endpoint::new(Default::default(), Some(Arc::new(config)), true);
+            let mut response = Vec::new();
+            let event = server.handle(
+                Instant::now(),
+                address,
+                None,
+                None,
+                BytesMut::from(packet.as_slice()),
+                &mut response,
+            );
+            let Some(DatagramEvent::NewConnection(incoming)) = event else {
+                panic!("expected unvalidated Incoming")
+            };
+            assert!(!incoming.remote_address_validated());
+            if respond_retry {
+                let _ = server.retry(incoming, &mut response).unwrap();
+                assert_eq!(response[0] & 0xf0, 0xf0);
+            } else {
+                server.ignore(incoming);
+                assert!(response.is_empty());
+            }
+        }
+    }
 }
 
 #[test]
