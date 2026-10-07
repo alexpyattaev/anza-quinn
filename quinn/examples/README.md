@@ -90,3 +90,41 @@ The expected output should be something like:
 
 Notice how the server sees multiple incoming connections with different IDs coming from the same
 endpoint.
+
+## Initial Filter Example
+
+The `initial_filter.rs` example shows how to rate limit inbound connection attempts with
+`InitialFilter`, which runs before any per-connection state is allocated. Strangers within the
+configured budget are answered with a Retry to confirm the source address, the rest are dropped.
+Peers bearing a valid token proceed without consuming the budget.
+
+```text
+$ cargo run --example initial_filter
+```
+
+The expected output should be something like:
+
+```text
+New client connecting to a server admitting 1 handshake/s
+[client] connected: 127.0.0.1:36999
+[server] accepted 127.0.0.1:47383
+[server] admitted=1 retried=1 ignored=0
+Familiar client connecting again - no problem
+[client] connected: 127.0.0.1:36999
+[server] accepted 127.0.0.1:47383
+[server] admitted=2 retried=1 ignored=0
+Unfamiliar client connecting
+[client] second attempt got no response within 500ms, as expected
+[server] admitted=2 retried=1 ignored=1
+```
+
+The first connection is retried once and then admitted when it comes back bearing the token. The
+familiar client reconnects with the NEW_TOKEN it received, so it is admitted without a Retry. A
+different client arriving immediately after exceeds the budget, is dropped, and hears nothing.
+
+`InitialFilter` has two hooks, both executed synchronously in the receive path; they must not block
+or re-enter the endpoint. `allow_initial` runs first and can enforce a global budget before any
+token authentication, replay-log access or Initial-key derivation. `decide` runs after token
+validation, so an `Ignore` there has already paid the token cost. Fast Retry skips Initial-key
+derivation with the built-in provider; custom crypto providers should override `supports_version`
+to get the same benefit. Existing connections bypass the hooks.
