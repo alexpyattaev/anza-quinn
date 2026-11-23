@@ -49,6 +49,7 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
+    pub(crate) max_ack_tracked_datagrams: usize,
     #[cfg(test)]
     pub(crate) deterministic_packet_numbers: bool,
 
@@ -318,6 +319,19 @@ impl TransportConfig {
         self
     }
 
+    /// Maximum number of ack-tracked datagrams whose outcome is not yet consumed
+    ///
+    /// Counts datagrams sent with [`Datagrams::send_ack_tracked`] that are queued, in flight, or
+    /// resolved but not yet returned by [`Datagrams::poll_outcome`]. Further tracked sends fail
+    /// until outcomes are consumed.
+    ///
+    /// [`Datagrams::send_ack_tracked`]: crate::Datagrams::send_ack_tracked
+    /// [`Datagrams::poll_outcome`]: crate::Datagrams::poll_outcome
+    pub fn max_ack_tracked_datagrams(&mut self, value: usize) -> &mut Self {
+        self.max_ack_tracked_datagrams = value;
+        self
+    }
+
     /// Whether to force every packet number to be used
     ///
     /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
@@ -404,6 +418,7 @@ impl Default for TransportConfig {
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
+            max_ack_tracked_datagrams: 65_536,
             #[cfg(test)]
             deterministic_packet_numbers: false,
 
@@ -441,6 +456,7 @@ impl fmt::Debug for TransportConfig {
             allow_spin,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
+            max_ack_tracked_datagrams,
             #[cfg(test)]
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
@@ -477,6 +493,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
+            .field("max_ack_tracked_datagrams", max_ack_tracked_datagrams)
             // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload);
         if cfg!(feature = "qlog") {

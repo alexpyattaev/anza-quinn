@@ -6,6 +6,7 @@ use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::crypto::ring::default_provider;
 
 use std::{
+    collections::HashMap,
     convert::TryInto,
     future::Future,
     io::{self, IoSliceMut},
@@ -34,6 +35,7 @@ use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tokio::{
     join,
@@ -44,7 +46,10 @@ use tracing::{error_span, info};
 use tracing_subscriber::EnvFilter;
 use udp::RecvMeta;
 
-use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
+use super::{
+    ClientConfig, DatagramId, DatagramOutcome, Endpoint, EndpointConfig, RecvStream,
+    SendAckTrackedError, SendDatagramError, SendStream, TransportConfig,
+};
 
 #[test]
 fn handshake_timeout() {
@@ -1615,6 +1620,84 @@ async fn read_datagrams() {
     ));
 }
 
+/// Per-datagram futures built on the batch outcome API, as an application would
+struct AckTracker {
+    conn: crate::Connection,
+    waiters: Arc<Mutex<HashMap<DatagramId, oneshot::Sender<DatagramOutcome>>>>,
+}
+
+impl AckTracker {
+    fn new(conn: crate::Connection) -> Self {
+        let waiters = Arc::new(Mutex::new(HashMap::<_, oneshot::Sender<_>>::new()));
+        tokio::spawn({
+            let conn = conn.clone();
+            let waiters = waiters.clone();
+            async move {
+                let mut outcomes = Vec::new();
+                // On connection loss, the remaining senders are dropped with the task
+                while conn.read_datagram_outcomes(&mut outcomes).await.is_ok() {
+                    let mut waiters = waiters.lock().unwrap();
+                    for (id, outcome) in outcomes.drain(..) {
+                        let waiter = waiters
+                            .remove(&id)
+                            .expect("every tracked datagram is registered before its outcome");
+                        // The caller may have stopped waiting
+                        let _ = waiter.send(outcome);
+                    }
+                }
+            }
+        });
+        Self { conn, waiters }
+    }
+
+    fn send(&self, data: Bytes) -> Result<oneshot::Receiver<DatagramOutcome>, SendAckTrackedError> {
+        // Hold the lock across the send so the dispatcher can't see the outcome before the waiter
+        let mut waiters = self.waiters.lock().unwrap();
+        let id = self.conn.send_ack_tracked(data)?;
+        let (tx, rx) = oneshot::channel();
+        waiters.insert(id, tx);
+        Ok(rx)
+    }
+}
+
+#[tokio::test]
+async fn ack_tracked_datagram_futures() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    let tracker = AckTracker::new(client.clone());
+    let sent = [&b"one"[..], b"two", b"three"];
+    let pending = sent.map(|x| tracker.send(Bytes::from_static(x)).unwrap());
+    for outcome in pending {
+        assert_eq!(outcome.await.unwrap(), DatagramOutcome::Acked);
+    }
+    for x in sent {
+        assert_eq!(server.read_datagram().await.unwrap(), x);
+    }
+
+    client.close(0u32.into(), b"done");
+    let mut outcomes = Vec::new();
+    assert!(matches!(
+        client.read_datagram_outcomes(&mut outcomes).await,
+        Err(crate::ConnectionError::LocallyClosed)
+    ));
+    assert!(matches!(
+        tracker.send(Bytes::from_static(b"late")),
+        Err(SendAckTrackedError::Send(
+            SendDatagramError::ConnectionLost(_)
+        ))
+    ));
+}
+
 #[tokio::test]
 async fn multiple_conns_with_zero_length_cids() {
     let _guard = subscribe();
@@ -1893,7 +1976,7 @@ async fn connection_handles_drop_after_driver_panic() {
         stopped_recv.stop(0u32.into()).unwrap();
         drop(finished_send);
 
-        let (signal, panicked) = tokio::sync::oneshot::channel();
+        let (signal, panicked) = oneshot::channel();
         *panic_signal.lock().unwrap() = Some(signal);
         connection
             .send_datagram(Bytes::from_static(b"panic"))
@@ -1957,7 +2040,7 @@ fn drop_after_poison(value: impl Sized, unwinding: bool) {
 #[derive(Debug)]
 struct PanickingSendSocket {
     inner: Box<dyn AsyncUdpSocket>,
-    panic_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    panic_signal: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl AsyncUdpSocket for PanickingSendSocket {
@@ -1993,7 +2076,7 @@ impl AsyncUdpSocket for PanickingSendSocket {
 #[derive(Debug)]
 struct PanickingSender {
     inner: Pin<Box<dyn UdpSender>>,
-    panic_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    panic_signal: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl UdpSender for PanickingSender {

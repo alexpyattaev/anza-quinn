@@ -231,6 +231,7 @@ mod tests {
             largest_acked: None,
             retransmits: Default::default(),
             stream_frames: Default::default(),
+            ack_tracked_datagrams: Default::default(),
         }
     }
 
