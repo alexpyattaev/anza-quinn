@@ -33,7 +33,7 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner,
     },
-    token::{ResetToken, Token, TokenPayload},
+    token::{ResetToken, TokenPayload},
     transport_parameters::TransportParameters,
 };
 
@@ -3548,7 +3548,7 @@ impl Connection {
                 continue;
             }
 
-            let token = Token::new(
+            let token = server_config.token_key.encode(
                 TokenPayload::Validation {
                     ip: remote_addr.ip(),
                     issued: server_config.time_source.now(),
@@ -3556,7 +3556,7 @@ impl Connection {
                 &mut self.rng,
             );
             let new_token = NewToken {
-                token: token.encode(&*server_config.token_key).into(),
+                token: token.into(),
             };
 
             if buf.len() + new_token.size() >= max_size {

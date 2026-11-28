@@ -126,9 +126,18 @@ pub trait ServerConfig: Send + Sync {
     fn initial_keys(&self, version: u32, dst_cid: ConnectionId)
     -> Result<Keys, UnsupportedVersion>;
 
+    /// Whether this provider supports Initial protection and Retry for a version.
+    ///
+    /// Must agree with `initial_keys`. Override to avoid key derivation on fast Retry.
+    /// The default preserves compatibility with existing providers.
+    fn supports_version(&self, version: u32) -> bool {
+        self.initial_keys(version, ConnectionId::new(&[0; 8]))
+            .is_ok()
+    }
+
     /// Generate the integrity tag for a retry packet
     ///
-    /// Never called if `initial_keys` rejected `version`.
+    /// Called only after `initial_keys` or `supports_version` accepted `version`.
     fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16];
 
     /// Start a server session with this configuration
@@ -191,6 +200,16 @@ pub struct ExportKeyingMaterialError;
 pub trait HandshakeTokenKey: Send + Sync {
     /// Derive AEAD using hkdf
     fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey>;
+
+    /// Derive a dedicated key for authenticating handshake tokens
+    ///
+    /// Called once when installing this key in a server configuration, not once per token.
+    /// The key must produce 32-byte tags and be independent of keys returned by
+    /// [`Self::aead_from_hkdf`]. It authenticates MAC-only Retry tokens and the outer MAC on
+    /// encrypted NEW_TOKENs, letting forged tokens be rejected without per-token AEAD work.
+    ///
+    /// Servers sharing tokens must use the same key.
+    fn token_authentication_key(&self) -> Box<dyn HmacKey>;
 }
 
 /// A key for sealing data with AEAD-based algorithms
